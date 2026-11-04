@@ -3113,13 +3113,13 @@ async def _base_vertex_proxy_route(
     encoded_endpoint = httpx.URL(endpoint).path
     verbose_proxy_logger.debug("requested endpoint %s", endpoint)
     headers: Mapping[str, str] = {}
-    api_key_to_use = get_litellm_virtual_key(request=request)
-    user_api_key_dict = await user_api_key_auth(
-        request=request,
-        api_key=api_key_to_use,
-    )
-
     if user_api_key_dict is None:
+        # Routes without a `Depends(user_api_key_auth)` (the discovery route) authenticate
+        # here, with the virtual key read from x-litellm-api-key before Authorization.
+        # Routes that already authenticated must not run user_api_key_auth a second time:
+        # every call reserves budget in Redis, and the first reservation was left
+        # orphaned on each /vertex_ai request, so the spend counter crept up to
+        # max_budget and raised BudgetExceededError while real spend was far below it (#50030).
         api_key_to_use = get_litellm_virtual_key(request=request)
         user_api_key_dict = await user_api_key_auth(
             request=request,

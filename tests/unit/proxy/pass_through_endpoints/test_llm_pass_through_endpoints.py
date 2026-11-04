@@ -650,6 +650,7 @@ class TestVertexAIPassThroughHandler:
                         endpoint="v1/projects/test-project/locations/us-central1/publishers/google/models/gemini-1.5-pro:generateContent",
                         request=mock_request,
                         fastapi_response=mock_response,
+                        user_api_key_dict=None,
                     )
 
                 assert exc_info.value.status_code == 401
@@ -657,6 +658,39 @@ class TestVertexAIPassThroughHandler:
                 mock_auth.assert_called_once()
                 call_args = mock_auth.call_args[1]
                 assert call_args["api_key"] == "Bearer test-key-123"
+
+    @pytest.mark.asyncio
+    async def test_async_vertex_proxy_route_does_not_authenticate_twice(self):
+        """
+        The route already authenticated through `Depends(user_api_key_auth)`, which
+        reserved budget for the request. Running user_api_key_auth again inside the
+        route reserved a second time and orphaned the first reservation, so the Redis
+        spend counter grew by one reservation per request until it hit max_budget
+        and every call failed with BudgetExceededError (#50030).
+        """
+        mock_request = Mock()
+        mock_request.headers = {"x-litellm-api-key": "test-key-123"}
+        mock_request.method = "POST"
+        mock_response = Mock()
+        authenticated = UserAPIKeyAuth(api_key="test-key-123")
+
+        with patch("litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.user_api_key_auth") as mock_auth:
+            with patch(
+                "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route"
+            ) as mock_pass_through:
+                mock_pass_through.return_value = AsyncMock(return_value={"status": "success"})
+
+                with pytest.raises(HTTPException) as exc_info:
+                    await vertex_proxy_route(
+                        endpoint="v1/projects/test-project/locations/us-central1/publishers/google/models/gemini-1.5-pro:generateContent",
+                        request=mock_request,
+                        fastapi_response=mock_response,
+                        user_api_key_dict=authenticated,
+                    )
+
+                assert exc_info.value.status_code == 401
+                mock_pass_through.assert_not_called()
+                mock_auth.assert_not_called()
 
     def test_vertex_passthrough_handler_multimodal_embedding_response(self):
         """
