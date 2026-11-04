@@ -75,6 +75,13 @@ def mock_riva(monkeypatch):
                 auth_calls["use_ssl"] = args[1] if len(args) > 1 else None
                 auth_calls["uri"] = args[2] if len(args) > 2 else None
                 auth_calls["metadata_args"] = args[3] if len(args) > 3 else None
+            # Like riva.client.Auth: no metadata_args means no per-call metadata
+            # until the handler provides it.
+            self.metadata = []
+            auth_calls["instance"] = self
+
+        def get_auth_metadata(self):
+            return []
 
     class FakeRecognitionConfig:
         def __init__(self, **kwargs):
@@ -595,7 +602,9 @@ def test_auth_nvcf_defaults_use_ssl_and_attaches_function_id(mock_riva, logging_
 
     assert mock_riva.auth_calls["uri"] == "grpc.nvcf.nvidia.com:443"
     assert mock_riva.auth_calls["use_ssl"] is True
-    metadata = dict(mock_riva.auth_calls["metadata_args"])
+    # Metadata goes out once per call, not as channel call credentials.
+    assert mock_riva.auth_calls["metadata_args"] is None
+    metadata = dict(mock_riva.auth_calls["instance"].get_auth_metadata())
     assert metadata["function-id"] == "abc-123"
     assert metadata["authorization"] == "Bearer nvapi-xxx"
 
@@ -623,10 +632,49 @@ def test_auth_self_hosted_defaults_no_ssl_and_no_function_id(mock_riva, logging_
 
     assert mock_riva.auth_calls["uri"] == "localhost:50051"
     assert mock_riva.auth_calls["use_ssl"] is False
-    metadata = dict(mock_riva.auth_calls["metadata_args"])
+    assert mock_riva.auth_calls["metadata_args"] is None
     # No function-id, no authorization metadata.
-    assert "function-id" not in metadata
-    assert "authorization" not in metadata
+    assert mock_riva.auth_calls["instance"].get_auth_metadata() == []
+
+
+@pytest.mark.parametrize("use_ssl", [False, True])
+def test_auth_sends_the_api_key_once_per_call_on_both_transports(mock_riva, logging_obj, use_ssl):
+    """
+    riva-client builds channel call credentials from ``metadata_args`` (TLS
+    only) and, from 2.19.0, also returns the same list from
+    ``get_auth_metadata`` for every call. Passing the key both ways sent it
+    twice over TLS on new clients and never on plaintext with old ones. The
+    handler must hand the key to the per-call path only, whatever the client
+    version does with ``metadata_args``.
+    """
+    mock_riva.responses["value"] = [
+        _fake_response(
+            results=[
+                _fake_result(is_final=True, alternatives=[_fake_alternative("ok")])
+            ]
+        )
+    ]
+    impl = NvidiaRivaAudioTranscription()
+    impl.audio_transcriptions(
+        model="m",
+        audio_file=_make_wav_bytes(),
+        optional_params={"use_ssl": use_ssl, "language_code": "en-US"},
+        litellm_params={},
+        model_response=TranscriptionResponse(),
+        timeout=60,
+        logging_obj=logging_obj,
+        api_key="riva-key",
+        api_base="riva.internal.company.com:50051",
+    )
+
+    assert mock_riva.auth_calls["use_ssl"] is use_ssl
+    assert mock_riva.auth_calls["metadata_args"] is None
+    auth = mock_riva.auth_calls["instance"]
+    per_call = auth.get_auth_metadata()
+    assert per_call == [("authorization", "Bearer riva-key")]
+    assert auth.metadata == per_call
+    # A second call gets a fresh copy, so a caller mutating one does not leak.
+    assert auth.get_auth_metadata() is not per_call
 
 
 def test_explicit_use_ssl_override_wins(mock_riva, logging_obj):

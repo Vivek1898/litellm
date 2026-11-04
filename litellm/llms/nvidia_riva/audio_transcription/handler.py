@@ -428,10 +428,23 @@ class NvidiaRivaAudioTranscription:
             metadata.append(("authorization", f"Bearer {api_key}"))
 
         try:
-            return _auth_factory(riva_module)(uri=api_base, use_ssl=use_ssl, metadata_args=metadata)
+            auth: Any = _auth_factory(riva_module)(uri=api_base, use_ssl=use_ssl)
         except TypeError:
             # Older riva-client signatures used positional-only args.
-            return _auth_factory(riva_module)(None, use_ssl, api_base, metadata)
+            auth = _auth_factory(riva_module)(None, use_ssl, api_base)
+
+        # The metadata is deliberately not passed as ``metadata_args``.
+        # ``riva.client.Auth`` turns that argument into gRPC channel call
+        # credentials, which only exist on a TLS channel, and ``ASRService``
+        # also attaches ``auth.get_auth_metadata()`` to every call. Before
+        # riva-client 2.19.0 that method returned an empty list, so a plaintext
+        # channel sent no authorization header at all; from 2.19.0 it returns
+        # the same list, so a TLS channel sent the header twice. Handing the
+        # metadata to the per-call path ourselves sends exactly one copy on
+        # every client version and both transports (#50059).
+        auth.metadata = list(metadata)
+        auth.get_auth_metadata = lambda: list(metadata)
+        return auth
 
     def _build_recognition_config_proto(
         self, riva_asr_module: _RivaAsrModule, recognition_config_dict: dict[str, Any]
